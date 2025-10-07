@@ -33,13 +33,11 @@ static ORIG_STAT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_ACCESS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_SYSPROP_GET: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_START_ACTIVITY: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-// Add a pointer for the Application.onCreate hook
 static ORIG_APP_ON_CREATE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
-
+const TARGET_PACKAGE: &str = "com.rem01gaming.disclosure";
 const DENYLIST_PACKAGES: &[&str] = &["com.sukisu.ultra", "com.rifsxd.ksunext"];
 static IS_TARGET_APP: AtomicBool = AtomicBool::new(false);
-// Add a flag to ensure the PLT hook is only applied once.
 static PLT_HOOKS_APPLIED: AtomicBool = AtomicBool::new(false);
 
 impl ZygiskModule for MyModule {
@@ -57,11 +55,11 @@ impl ZygiskModule for MyModule {
     }
 
     fn pre_app_specialize(&self, _api: ZygiskApi, args: &mut AppSpecializeArgs, env: &mut JNIEnv) {
-        // Only perform process identification here. DO NOT apply PLT hooks.
+        // Use `starts_with` to cover all application processes
         if let Ok(process_name) = env.get_string(*args.nice_name) {
             let process_name: String = process_name.into();
             
-            if process_name == "com.rem01gaming.disclosure" {
+            if process_name.starts_with(TARGET_PACKAGE) {
                 info!("GeoInk-Core activated for target process: {}", process_name);
                 IS_TARGET_APP.store(true, Ordering::Relaxed);
             }
@@ -71,7 +69,7 @@ impl ZygiskModule for MyModule {
 
 impl MyModule {
     unsafe fn register_jni_hooks(&self, api: ZygiskApi, env: &mut JNIEnv) {
-        // Hook untuk startActivity
+        // Hook for startActivity
         info!("Registering JNI hook for Activity.startActivity...");
         let class_name_activity = "android.app.Activity";
         let class_name_activity_cstr = CString::new(class_name_activity).unwrap();
@@ -91,7 +89,7 @@ impl MyModule {
         let _ = CString::from_raw(methods_activity[0].name);
         let _ = CString::from_raw(methods_activity[0].signature);
 
-        // Add a new JNI hook for Application.onCreate
+        // Hook for Application.onCreate
         info!("Registering JNI hook for Application.onCreate...");
         let class_name_app = "android.app.Application";
         let class_name_app_cstr = CString::new(class_name_app).unwrap();
@@ -113,30 +111,25 @@ impl MyModule {
     }
     
     unsafe fn apply_plt_hooks(&self, api: ZygiskApi) {
-        // This function will now be called from hook_application_on_create
         info!("Applying PLT hooks at stable stage...");
-        
         let mut orig_stat_ptr: *mut () = std::ptr::null_mut();
         api.plt_hook_register(
             CStr::from_bytes_with_nul(b"libc.so\0").unwrap(), CStr::from_bytes_with_nul(b"stat\0").unwrap(),
             hook_stat as *mut c_void as *mut (), Some(&mut orig_stat_ptr),
         );
         if !orig_stat_ptr.is_null() { ORIG_STAT.store(orig_stat_ptr, Ordering::Relaxed); }
-
         let mut orig_access_ptr: *mut () = std::ptr::null_mut();
         api.plt_hook_register(
             CStr::from_bytes_with_nul(b"libc.so\0").unwrap(), CStr::from_bytes_with_nul(b"access\0").unwrap(),
             hook_access as *mut c_void as *mut (), Some(&mut orig_access_ptr),
         );
         if !orig_access_ptr.is_null() { ORIG_ACCESS.store(orig_access_ptr, Ordering::Relaxed); }
-        
         let mut orig_sysprop_ptr: *mut () = std::ptr::null_mut();
         api.plt_hook_register(
             CStr::from_bytes_with_nul(b"libc.so\0").unwrap(), CStr::from_bytes_with_nul(b"__system_property_get\0").unwrap(),
             hook_sysprop_get as *mut c_void as *mut (), Some(&mut orig_sysprop_ptr),
         );
         if !orig_sysprop_ptr.is_null() { ORIG_SYSPROP_GET.store(orig_sysprop_ptr, Ordering::Relaxed); }
-        
         if !api.plt_hook_commit() {
             error!("Failed to commit PLT hooks.");
         } else {
@@ -170,6 +163,9 @@ extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobjec
 }
 
 extern "C" fn hook_stat(pathname: *const c_char, statbuf: *mut stat) -> c_int {
+    let orig_ptr = ORIG_STAT.load(Ordering::Relaxed);
+    if orig_ptr.is_null() { return 0; }
+    let orig_fn = unsafe { std::mem::transmute::<*mut (), extern "C" fn(*const c_char, *mut stat) -> c_int>(orig_ptr) };
     if IS_TARGET_APP.load(Ordering::Relaxed) {
         if !pathname.is_null() {
             let path_str = unsafe { CStr::from_ptr(pathname) }.to_str().unwrap_or_default();
@@ -179,14 +175,12 @@ extern "C" fn hook_stat(pathname: *const c_char, statbuf: *mut stat) -> c_int {
             }
         }
     }
-    let orig_fn = unsafe { 
-        std::mem::transmute::<*mut (), extern "C" fn(*const c_char, *mut stat) -> c_int>(
-            ORIG_STAT.load(Ordering::Relaxed)
-        ) 
-    };
     orig_fn(pathname, statbuf)
 }
 extern "C" fn hook_access(pathname: *const c_char, mode: c_int) -> c_int {
+    let orig_ptr = ORIG_ACCESS.load(Ordering::Relaxed);
+    if orig_ptr.is_null() { return 0; }
+    let orig_fn = unsafe { std::mem::transmute::<*mut (), extern "C" fn(*const c_char, c_int) -> c_int>(orig_ptr) };
     if IS_TARGET_APP.load(Ordering::Relaxed) {
         if !pathname.is_null() {
             let path_str = unsafe { CStr::from_ptr(pathname) }.to_str().unwrap_or_default();
@@ -196,14 +190,12 @@ extern "C" fn hook_access(pathname: *const c_char, mode: c_int) -> c_int {
             }
         }
     }
-    let orig_fn = unsafe { 
-        std::mem::transmute::<*mut (), extern "C" fn(*const c_char, c_int) -> c_int>(
-            ORIG_ACCESS.load(Ordering::Relaxed)
-        ) 
-    };
     orig_fn(pathname, mode)
 }
 extern "C" fn hook_sysprop_get(name: *const c_char, value: *mut c_char) -> c_int {
+    let orig_ptr = ORIG_SYSPROP_GET.load(Ordering::Relaxed);
+    if orig_ptr.is_null() { return 0; }
+    let orig_fn = unsafe { std::mem::transmute::<*mut (), extern "C" fn(*const c_char, *mut c_char) -> c_int>(orig_ptr) };
     if IS_TARGET_APP.load(Ordering::Relaxed) {
         if !name.is_null() {
             let prop_name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or_default();
@@ -219,41 +211,26 @@ extern "C" fn hook_sysprop_get(name: *const c_char, value: *mut c_char) -> c_int
             }
         }
     }
-    let orig_fn = unsafe { 
-        std::mem::transmute::<*mut (), extern "C" fn(*const c_char, *mut c_char) -> c_int>(
-            ORIG_SYSPROP_GET.load(Ordering::Relaxed)
-        ) 
-    };
     orig_fn(name, value)
 }
 #[no_mangle]
 extern "C" fn hook_start_activity(env: *mut jni::sys::JNIEnv, activity: jobject, intent: jobject) {
-    let is_target = IS_TARGET_APP.load(Ordering::Relaxed);
     let orig_ptr = ORIG_START_ACTIVITY.load(Ordering::Relaxed);
     let orig_fn = if !orig_ptr.is_null() {
         Some(unsafe { std::mem::transmute::<*mut (), extern "C" fn(*mut jni::sys::JNIEnv, jobject, jobject)>(orig_ptr) })
-    } else {
-        None
-    };
-
-    if !is_target || orig_fn.is_none() {
+    } else { None };
+    if !IS_TARGET_APP.load(Ordering::Relaxed) || orig_fn.is_none() {
         if let Some(f) = orig_fn { f(env, activity, intent); }
         return;
     }
-
     let jni_env = match unsafe { JNIEnv::from_raw(env) } {
         Ok(env) => env,
-        Err(_) => {
-            if let Some(f) = orig_fn { f(env, activity, intent); }
-            return;
-        }
+        Err(_) => { if let Some(f) = orig_fn { f(env, activity, intent); } return; }
     };
-
     if intent.is_null() {
         if let Some(f) = orig_fn { f(env, activity, intent); }
         return;
     }
-    
     let intent_obj = JObject::from(intent);
     if let Ok(component_result) = jni_env.call_method(intent_obj, "getComponent", "()Landroid/content/ComponentName;", &[]) {
         if let Ok(component_obj) = component_result.l() {
@@ -273,6 +250,5 @@ extern "C" fn hook_start_activity(env: *mut jni::sys::JNIEnv, activity: jobject,
             }
         }
     }
-    
     if let Some(f) = orig_fn { f(env, activity, intent); }
 }
