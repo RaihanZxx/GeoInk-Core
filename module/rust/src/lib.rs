@@ -15,7 +15,6 @@ use {android_logger::Config, log::Level};
 pub use api::ZygiskApi;
 pub use binding::{AppSpecializeArgs, ServerSpecializeArgs, StateFlags, ZygiskOption, API_VERSION};
 use jni::JNIEnv;
-use jni::strings::JNIStr;
 pub use module::ZygiskModule;
 
 use std::ffi::{c_void, CStr, CString};
@@ -69,13 +68,11 @@ impl ZygiskModule for MyModule {
 
 impl MyModule {
     unsafe fn register_jni_hooks(&self, api: ZygiskApi, env: &mut JNIEnv) {
-        // Use Box::leak to create a CString with a static lifetime
-        // Then convert it to JNIStr for use in hook_jni_native_methods
+        // Use Box::leak to create a CString with a static lifetime and call the fixed API.
         
         // Hook For startActivity
         info!("Registering JNI hook for Activity.startActivity...");
         let class_name_activity = Box::leak(Box::new(CString::new("android/app/Activity").unwrap()));
-        let class_name_activity_jni: &JNIStr = std::mem::transmute(class_name_activity.as_c_str());
         let mut methods_activity = [
             jni::sys::JNINativeMethod {
                 name: CString::new("startActivity").unwrap().into_raw(),
@@ -83,7 +80,7 @@ impl MyModule {
                 fnPtr: hook_start_activity as *mut c_void,
             },
         ];
-        api.hook_jni_native_methods(*env, class_name_activity_jni, &mut methods_activity);
+        api.hook_jni_native_methods(*env, class_name_activity, &mut methods_activity);
         let orig_ptr_activity = methods_activity[0].fnPtr;
         if !orig_ptr_activity.is_null() {
             ORIG_START_ACTIVITY.store(orig_ptr_activity as *mut (), Ordering::Relaxed);
@@ -94,7 +91,6 @@ impl MyModule {
         // Hook For Application.onCreate
         info!("Registering JNI hook for Application.onCreate...");
         let class_name_app = Box::leak(Box::new(CString::new("android/app/Application").unwrap()));
-        let class_name_app_jni: &JNIStr = std::mem::transmute(class_name_app.as_c_str());
         let mut methods_app = [
             jni::sys::JNINativeMethod {
                 name: CString::new("onCreate").unwrap().into_raw(),
@@ -102,7 +98,7 @@ impl MyModule {
                 fnPtr: hook_application_on_create as *mut c_void,
             },
         ];
-        api.hook_jni_native_methods(*env, class_name_app_jni, &mut methods_app);
+        api.hook_jni_native_methods(*env, class_name_app, &mut methods_app);
         let orig_ptr_app = methods_app[0].fnPtr;
         if !orig_ptr_app.is_null() {
             ORIG_APP_ON_CREATE.store(orig_ptr_app as *mut (), Ordering::Relaxed);
@@ -113,7 +109,6 @@ impl MyModule {
         // Hook MainActivity.onCreate
         info!("Registering JNI hook for MainActivity.onCreate...");
         let class_name_main = Box::leak(Box::new(CString::new("com/rem01gaming/disclosure/MainActivity").unwrap()));
-        let class_name_main_jni: &JNIStr = std::mem::transmute(class_name_main.as_c_str());
         let mut methods_main_activity = [
             jni::sys::JNINativeMethod {
                 name: CString::new("onCreate").unwrap().into_raw(),
@@ -121,7 +116,7 @@ impl MyModule {
                 fnPtr: hook_activity_on_create as *mut c_void,
             },
         ];
-        api.hook_jni_native_methods(*env, class_name_main_jni, &mut methods_main_activity);
+        api.hook_jni_native_methods(*env, class_name_main, &mut methods_main_activity);
         let orig_ptr_main_activity = methods_main_activity[0].fnPtr;
         if !orig_ptr_main_activity.is_null() {
             ORIG_ACTIVITY_ON_CREATE.store(orig_ptr_main_activity as *mut (), Ordering::Relaxed);
@@ -129,7 +124,7 @@ impl MyModule {
         let _ = CString::from_raw(methods_main_activity[0].name);
         let _ = CString::from_raw(methods_main_activity[0].signature);
     }
-
+    
     unsafe fn apply_plt_hooks(&self, api: ZygiskApi) {
         info!("Applying PLT hooks at stable stage...");
         let mut orig_stat_ptr: *mut () = std::ptr::null_mut();
@@ -138,21 +133,18 @@ impl MyModule {
             hook_stat as *mut c_void as *mut (), Some(&mut orig_stat_ptr),
         );
         if !orig_stat_ptr.is_null() { ORIG_STAT.store(orig_stat_ptr, Ordering::Relaxed); }
-
         let mut orig_access_ptr: *mut () = std::ptr::null_mut();
         api.plt_hook_register(
             CStr::from_bytes_with_nul(b"libc.so\0").unwrap(), CStr::from_bytes_with_nul(b"access\0").unwrap(),
             hook_access as *mut c_void as *mut (), Some(&mut orig_access_ptr),
         );
         if !orig_access_ptr.is_null() { ORIG_ACCESS.store(orig_access_ptr, Ordering::Relaxed); }
-
         let mut orig_sysprop_ptr: *mut () = std::ptr::null_mut();
         api.plt_hook_register(
             CStr::from_bytes_with_nul(b"libc.so\0").unwrap(), CStr::from_bytes_with_nul(b"__system_property_get\0").unwrap(),
             hook_sysprop_get as *mut c_void as *mut (), Some(&mut orig_sysprop_ptr),
         );
         if !orig_sysprop_ptr.is_null() { ORIG_SYSPROP_GET.store(orig_sysprop_ptr, Ordering::Relaxed); }
-        
         if !api.plt_hook_commit() {
             error!("Failed to commit PLT hooks.");
         } else {
@@ -160,11 +152,9 @@ impl MyModule {
         }
     }
 }
-
 #[no_mangle]
 extern "C" fn hook_activity_on_create(env: *mut jni::sys::JNIEnv, activity: jobject, bundle: jbundle) {
     let is_target = IS_TARGET_APP.load(Ordering::Relaxed);
-    
     if is_target {
         if PLT_HOOKS_APPLIED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             let api_table = unsafe { &*(env as *const *const i32).offset(-2) as *const _ as *const crate::binding::RawApiTable };
@@ -172,7 +162,6 @@ extern "C" fn hook_activity_on_create(env: *mut jni::sys::JNIEnv, activity: jobj
             unsafe { MODULE.apply_plt_hooks(api) };
         }
     }
-
     let orig_ptr = ORIG_ACTIVITY_ON_CREATE.load(Ordering::Relaxed);
     if !orig_ptr.is_null() {
         let orig_fn = unsafe {
@@ -181,11 +170,9 @@ extern "C" fn hook_activity_on_create(env: *mut jni::sys::JNIEnv, activity: jobj
         orig_fn(env, activity, bundle);
     }
 }
-
 #[no_mangle]
 extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobject) {
     let is_target = IS_TARGET_APP.load(Ordering::Relaxed);
-    
     if is_target {
         if PLT_HOOKS_APPLIED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             let api_table = unsafe { &*(env as *const *const i32).offset(-2) as *const _ as *const crate::binding::RawApiTable };
@@ -193,7 +180,6 @@ extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobjec
             unsafe { MODULE.apply_plt_hooks(api) };
         }
     }
-
     let orig_ptr = ORIG_APP_ON_CREATE.load(Ordering::Relaxed);
     if !orig_ptr.is_null() {
         let orig_fn = unsafe {
@@ -202,7 +188,6 @@ extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobjec
         orig_fn(env, app);
     }
 }
-
 extern "C" fn hook_stat(pathname: *const c_char, statbuf: *mut stat) -> c_int {
     let orig_ptr = ORIG_STAT.load(Ordering::Relaxed);
     if orig_ptr.is_null() { return 0; }

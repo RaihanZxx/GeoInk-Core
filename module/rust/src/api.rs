@@ -1,7 +1,6 @@
 use std::ffi::CStr;
 
 use jni::{
-    strings::JNIStr,
     sys::{jint, JNINativeMethod},
     JNIEnv,
 };
@@ -98,7 +97,7 @@ impl<'a> ZygiskApi<'a> {
     pub unsafe fn hook_jni_native_methods(
         &self,
         env: JNIEnv,
-        class_name: &JNIStr,
+        class_name: &CStr, // Change type from &JNIStr to &CStr
         methods: &mut [JNINativeMethod],
     ) {
         if let Some(func) = self.inner.hook_jni_native_methods {
