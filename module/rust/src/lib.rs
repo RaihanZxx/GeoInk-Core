@@ -15,6 +15,7 @@ use {android_logger::Config, log::Level};
 pub use api::ZygiskApi;
 pub use binding::{AppSpecializeArgs, ServerSpecializeArgs, StateFlags, ZygiskOption, API_VERSION};
 use jni::JNIEnv;
+use jni::strings::JNIStr;
 pub use module::ZygiskModule;
 
 use std::ffi::{c_void, CStr, CString};
@@ -40,6 +41,11 @@ const DENYLIST_PACKAGES: &[&str] = &["com.sukisu.ultra", "com.rifsxd.ksunext"];
 static IS_TARGET_APP: AtomicBool = AtomicBool::new(false);
 static PLT_HOOKS_APPLIED: AtomicBool = AtomicBool::new(false);
 
+// Define the class name as a static constant for a safe lifetime.
+const CLASS_ACTIVITY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"android/app/Activity\0") };
+const CLASS_APPLICATION: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"android/app/Application\0") };
+
+
 impl ZygiskModule for MyModule {
     fn on_load(&self, api: ZygiskApi, env: &mut JNIEnv) {
         #[cfg(target_os = "android")]
@@ -49,13 +55,11 @@ impl ZygiskModule for MyModule {
             );
         }
         
-        // Register ALL JNI hooks here. This is safe to do globally.
         unsafe { self.register_jni_hooks(api, env); }
         info!("GeoInk-Core loaded - Ready to bypass detections");
     }
 
     fn pre_app_specialize(&self, _api: ZygiskApi, args: &mut AppSpecializeArgs, env: &mut JNIEnv) {
-        // Use `starts_with` to cover all application processes
         if let Ok(process_name) = env.get_string(*args.nice_name) {
             let process_name: String = process_name.into();
             
@@ -69,11 +73,12 @@ impl ZygiskModule for MyModule {
 
 impl MyModule {
     unsafe fn register_jni_hooks(&self, api: ZygiskApi, env: &mut JNIEnv) {
-        // Hook for startActivity
+        // Use static constants for class names
+        
+        // Hook For startActivity
         info!("Registering JNI hook for Activity.startActivity...");
-        let class_name_activity = "android.app.Activity";
-        let class_name_activity_cstr = CString::new(class_name_activity).unwrap();
-        let class_name_activity_jni = jni::strings::JNIStr::from_ptr(class_name_activity_cstr.as_ptr());
+        // Transmute static CStr to static JNIStr. This is safe because JNIStr is repr(transparent)
+        let class_name_activity: &JNIStr = std::mem::transmute(CLASS_ACTIVITY);
         let mut methods_activity = [
             jni::sys::JNINativeMethod {
                 name: CString::new("startActivity").unwrap().into_raw(),
@@ -81,7 +86,7 @@ impl MyModule {
                 fnPtr: hook_start_activity as *mut c_void,
             },
         ];
-        api.hook_jni_native_methods(env.clone(), &class_name_activity_jni, &mut methods_activity);
+        api.hook_jni_native_methods(*env, class_name_activity, &mut methods_activity);
         let orig_ptr_activity = methods_activity[0].fnPtr;
         if !orig_ptr_activity.is_null() {
             ORIG_START_ACTIVITY.store(orig_ptr_activity as *mut (), Ordering::Relaxed);
@@ -89,11 +94,9 @@ impl MyModule {
         let _ = CString::from_raw(methods_activity[0].name);
         let _ = CString::from_raw(methods_activity[0].signature);
 
-        // Hook for Application.onCreate
+        // Hook For Application.onCreate
         info!("Registering JNI hook for Application.onCreate...");
-        let class_name_app = "android.app.Application";
-        let class_name_app_cstr = CString::new(class_name_app).unwrap();
-        let class_name_app_jni = jni::strings::JNIStr::from_ptr(class_name_app_cstr.as_ptr());
+        let class_name_app: &JNIStr = std::mem::transmute(CLASS_APPLICATION);
         let mut methods_app = [
             jni::sys::JNINativeMethod {
                 name: CString::new("onCreate").unwrap().into_raw(),
@@ -101,7 +104,7 @@ impl MyModule {
                 fnPtr: hook_application_on_create as *mut c_void,
             },
         ];
-        api.hook_jni_native_methods(env.clone(), &class_name_app_jni, &mut methods_app);
+        api.hook_jni_native_methods(*env, class_name_app, &mut methods_app);
         let orig_ptr_app = methods_app[0].fnPtr;
         if !orig_ptr_app.is_null() {
             ORIG_APP_ON_CREATE.store(orig_ptr_app as *mut (), Ordering::Relaxed);
@@ -109,7 +112,7 @@ impl MyModule {
         let _ = CString::from_raw(methods_app[0].name);
         let _ = CString::from_raw(methods_app[0].signature);
     }
-    
+
     unsafe fn apply_plt_hooks(&self, api: ZygiskApi) {
         info!("Applying PLT hooks at stable stage...");
         let mut orig_stat_ptr: *mut () = std::ptr::null_mut();
@@ -137,22 +140,16 @@ impl MyModule {
         }
     }
 }
-
-// Add this new hook function
 #[no_mangle]
 extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobject) {
     let is_target = IS_TARGET_APP.load(Ordering::Relaxed);
-    
     if is_target {
-        // Use compare_exchange to ensure the hook is only applied once.
         if PLT_HOOKS_APPLIED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             let api_table = unsafe { &*(env as *const *const i32).offset(-2) as *const _ as *const crate::binding::RawApiTable };
             let api = ZygiskApi::from_raw(unsafe { &*api_table });
             unsafe { MODULE.apply_plt_hooks(api) };
         }
     }
-
-    // Always call the original onCreate function
     let orig_ptr = ORIG_APP_ON_CREATE.load(Ordering::Relaxed);
     if !orig_ptr.is_null() {
         let orig_fn = unsafe {
@@ -161,7 +158,6 @@ extern "C" fn hook_application_on_create(env: *mut jni::sys::JNIEnv, app: jobjec
         orig_fn(env, app);
     }
 }
-
 extern "C" fn hook_stat(pathname: *const c_char, statbuf: *mut stat) -> c_int {
     let orig_ptr = ORIG_STAT.load(Ordering::Relaxed);
     if orig_ptr.is_null() { return 0; }
