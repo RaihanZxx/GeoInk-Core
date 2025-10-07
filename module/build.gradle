@@ -1,0 +1,128 @@
+import org.apache.tools.ant.filters.FixCrLfFilter
+
+import java.security.MessageDigest
+
+plugins {
+    id 'com.android.library'
+    id "org.mozilla.rust-android-gradle.rust-android" version "0.9.2"
+}
+
+apply from: file(rootProject.file('module.gradle'))
+
+android {
+    compileSdk target_sdk
+    defaultConfig {
+        minSdk min_sdk
+        targetSdk target_sdk
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86", "x86_64"
+        }
+    }
+    ndkVersion '26.2.11394342'
+}
+
+cargo {
+    verbose = true
+    profile = project.hasProperty('release') ? "release" : "debug"
+    module  = "./rust"       // Or whatever directory contains your Cargo.toml
+    libname = "geoink_core"          // Or whatever matches Cargo.toml's [package] name.
+    targets = ["arm", "arm64", "x86", "x86_64"]  // See bellow for a longer list of options
+}
+
+
+afterEvaluate {
+    // The `cargoBuild` task isn't available until after evaluation.
+    android.libraryVariants.all { variant ->
+        def variantCapped = variant.name.capitalize()
+        def productFlavor = ""
+        variant.productFlavors.each {
+            productFlavor += "${it.name.capitalize()}"
+        }
+        def buildType = "${variant.buildType.name.capitalize()}"
+        tasks["generate${productFlavor}${buildType}Assets"].dependsOn(tasks["cargoBuild"])
+        tasks["strip${variantCapped}DebugSymbols"].dependsOn(tasks["generate${productFlavor}${buildType}Assets"])
+    }
+
+    android.libraryVariants.forEach { variant ->
+        def variantCapped = variant.name.capitalize()
+        def variantLowered = variant.name.toLowerCase()
+
+        def zipName = "${magiskModuleId.replace('_', '-')}-${moduleVersion}-${variantLowered}.zip"
+        def magiskDir = file("$outDir/magisk_module_$variantLowered")
+
+        task("prepareMagiskFiles${variantCapped}", type: Sync) {
+            dependsOn("strip${variantCapped}DebugSymbols")
+            dependsOn("assemble$variantCapped")
+
+            def geoink_corePath = "$rootDir/geoink_core/magisk_module"
+
+            into magiskDir
+            from(geoink_corePath) {
+                exclude 'module.prop'
+            }
+            from(geoink_corePath) {
+                include 'module.prop'
+                expand([
+                        id         : magiskModuleId,
+                        name       : moduleName,
+                        version    : moduleVersion,
+                        versionCode: moduleVersionCode.toString(),
+                        author     : moduleAuthor,
+                        description: moduleDescription,
+                ])
+                filter(FixCrLfFilter.class,
+                        eol: FixCrLfFilter.CrLf.newInstance("lf"))
+            }
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib/arm64-v8a") {
+                into 'lib/arm64-v8a'
+            }
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib/armeabi-v7a") {
+                into 'lib/armeabi-v7a'
+            }
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib/x86") {
+                into 'lib/x86'
+            }
+            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib/x86_64") {
+                into 'lib/x86_64'
+            }
+            doLast {
+                fileTree("$magiskDir").visit { f ->
+                    if (f.directory) return
+                    if (f.file.name == '.gitattributes') return
+
+                    def md = MessageDigest.getInstance("SHA-256")
+                    f.file.eachByte 4096, { bytes, size ->
+                        md.update(bytes, 0, size)
+                    }
+                    file(f.file.path + ".sha256sum").text = md.digest().encodeHex()
+                }
+            }
+        }
+
+        task("zip${variantCapped}", type: Zip) {
+            dependsOn("prepareMagiskFiles${variantCapped}")
+            from magiskDir
+            archiveName zipName
+            destinationDir outDir
+        }
+
+        task("push${variantCapped}", type: Exec) {
+            dependsOn("zip${variantCapped}")
+            workingDir outDir
+            commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
+        }
+
+        task("flash${variantCapped}", type: Exec) {
+            dependsOn("push${variantCapped}")
+            commandLine android.adbExecutable, "shell", "su", "-c",
+                    "magisk --install-module /data/local/tmp/${zipName}"
+        }
+
+        task("flashAndReboot${variantCapped}", type: Exec) {
+            dependsOn("flash${variantCapped}")
+            commandLine android.adbExecutable, "shell", "reboot"
+        }
+
+        variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
+    }
+}

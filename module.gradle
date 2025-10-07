@@ -1,0 +1,9 @@
+ext {
+    magiskModuleId = "geoink-core"
+
+    moduleName = "GeoInk-Core"
+    moduleAuthor = "HanSoBored"
+    moduleDescription = "A Zygisk module designed to bypass root detection and system integrity checks on certain applications. Built with Rust for performance and stability. This module actively hides common files, fakes custom ROM properties, and other traces of modification. [Eksperimental]"
+    moduleVersion = "v0.0.1"
+    moduleVersionCode = 1
+}
