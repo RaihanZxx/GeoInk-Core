@@ -20,7 +20,7 @@ pub use module::ZygiskModule;
 
 use std::ffi::{c_void, CStr, CString};
 use libc::{c_char, c_int, stat};
-use jni::sys::jobject;
+use jni::sys::{jobject, jobject as jbundle};
 use jni::objects::JObject;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -35,6 +35,7 @@ static ORIG_ACCESS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_SYSPROP_GET: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_START_ACTIVITY: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_APP_ON_CREATE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+static ORIG_ACTIVITY_ON_CREATE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 const TARGET_PACKAGE: &str = "com.rem01gaming.disclosure";
 const DENYLIST_PACKAGES: &[&str] = &["com.sukisu.ultra", "com.rifsxd.ksunext"];
@@ -44,6 +45,7 @@ static PLT_HOOKS_APPLIED: AtomicBool = AtomicBool::new(false);
 // Define the class name as a static constant for a safe lifetime.
 const CLASS_ACTIVITY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"android/app/Activity\0") };
 const CLASS_APPLICATION: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"android/app/Application\0") };
+const CLASS_MAIN_ACTIVITY: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"com/rem01gaming/disclosure/MainActivity\0") };
 
 
 impl ZygiskModule for MyModule {
@@ -111,6 +113,24 @@ impl MyModule {
         } else { error!("Failed to hook Application.onCreate"); }
         let _ = CString::from_raw(methods_app[0].name);
         let _ = CString::from_raw(methods_app[0].signature);
+
+        // Hook MainActivity.onCreate as the main trigger
+        info!("Registering JNI hook for MainActivity.onCreate...");
+        let class_name_main_activity: &JNIStr = std::mem::transmute(CLASS_MAIN_ACTIVITY);
+        let mut methods_main_activity = [
+            jni::sys::JNINativeMethod {
+                name: CString::new("onCreate").unwrap().into_raw(),
+                signature: CString::new("(Landroid/os/Bundle;)V").unwrap().into_raw(),
+                fnPtr: hook_activity_on_create as *mut c_void,
+            },
+        ];
+        api.hook_jni_native_methods(*env, class_name_main_activity, &mut methods_main_activity);
+        let orig_ptr_main_activity = methods_main_activity[0].fnPtr;
+        if !orig_ptr_main_activity.is_null() {
+            ORIG_ACTIVITY_ON_CREATE.store(orig_ptr_main_activity as *mut (), Ordering::Relaxed);
+        } else { error!("Failed to hook MainActivity.onCreate"); }
+        let _ = CString::from_raw(methods_main_activity[0].name);
+        let _ = CString::from_raw(methods_main_activity[0].signature);
     }
 
     unsafe fn apply_plt_hooks(&self, api: ZygiskApi) {
@@ -247,4 +267,27 @@ extern "C" fn hook_start_activity(env: *mut jni::sys::JNIEnv, activity: jobject,
         }
     }
     if let Some(f) = orig_fn { f(env, activity, intent); }
+}
+
+#[no_mangle]
+extern "C" fn hook_activity_on_create(env: *mut jni::sys::JNIEnv, activity: jobject, bundle: jbundle) {
+    let is_target = IS_TARGET_APP.load(Ordering::Relaxed);
+    
+    if is_target {
+        // Apply the PLT hook from here, as this is the most appropriate execution point.
+        if PLT_HOOKS_APPLIED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let api_table = unsafe { &*(env as *const *const i32).offset(-2) as *const _ as *const crate::binding::RawApiTable };
+            let api = ZygiskApi::from_raw(unsafe { &*api_table });
+            unsafe { MODULE.apply_plt_hooks(api) };
+        }
+    }
+
+    // Always call the original onCreate function
+    let orig_ptr = ORIG_ACTIVITY_ON_CREATE.load(Ordering::Relaxed);
+    if !orig_ptr.is_null() {
+        let orig_fn = unsafe {
+            std::mem::transmute::<*mut (), extern "C" fn(*mut jni::sys::JNIEnv, jobject, jbundle)>(orig_ptr)
+        };
+        orig_fn(env, activity, bundle);
+    }
 }
